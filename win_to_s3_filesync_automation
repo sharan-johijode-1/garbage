@@ -1,0 +1,238 @@
+param <#Command Line Switch to determine if files in SourceDirectory will be deleted. Default is to NOT delete.#>
+(
+[switch]$DeleteSource = $False
+)
+
+<#Add AWSLoggingListener for errors#>
+Add-AWSLoggingListener -Name S3Logs -LogFilePath C:\Logs\PMS-Uploader.txt -source Amazon.S3
+
+<# Variables for script #>
+$localDirectory = "D:\GHA-PMS-Route"
+$brandCodes = @()
+$S3BucketName = "gha-propertymanagementsystems-s3uploader"
+$AWSRegion = "ca-central-1"
+$LogFile =""
+
+<#Function to install AWS for Powershell MSI#>
+Function InstallAWSToolsforWindowsPowerShell() {
+$AWSPowerShellModuleSourceURL = "http://sdk-for-net.amazonwebservices.com/latest/AWSToolsAndSDKForNet.msi"
+$DestinationFolder = "$ENV:homedrive\$env:homepath\Downloads"
+If (!(Test-Path $DestinationFolder))
+{
+New-Item $DestinationFolder -ItemType Directory -Force
+}
+Write-Host "Downloading AWS PowerShell Module from $AWSPowerShellModuleSourceURL"
+$global:LogFile += "Downloading AWS PowerShell Module from $AWSPowerShellModuleSourceURL`n"
+try
+{
+Invoke-WebRequest -Uri $AWSPowerShellModuleSourceURL -OutFile "$DestinationFolder\AWSToolsAndSDKForNet.msi" -ErrorAction STOP
+$msifile = "$DestinationFolder\AWSToolsAndSDKForNet.msi"
+$arguments = @(
+"/i"
+"`"$msiFile`""
+"/qb"
+"/norestart"
+)
+Write-Host "Attempting to install $msifile"
+$global:LogFile += "Attempting to install $msifile`n"
+$process = Start-Process -FilePath msiexec.exe -ArgumentList $arguments -Wait -PassThru
+if ($process.ExitCode -eq 0)
+{
+Write-Host "$msiFile has been successfully installed"
+$global:LogFile += "$msiFile has been successfully installed`n"
+}
+else
+{
+Write-Host "installer exit code $($process.ExitCode) for file $($msifile)"
+$global:LogFile += "installer exit code $($process.ExitCode) for file $($msifile)`n"
+}
+}
+catch
+{
+Write-Host $_.Exception.Message
+$global:LogFile += "$_.Exception.Message`n"
+}
+} <#end function InstallAWSToolsforWindowsPowerShell#>
+
+<#Function to check/ensure if Powershell for AWS is installed and present in the current PS session#>
+<#Leverages the InstallAWSToolsforWindowsPowerShell function#>
+Function Get-MyModule
+{
+Param([string]$name)
+if (-not(Get-Module -name $name))
+{
+if(Get-Module -ListAvailable |
+Where-Object { $_.name -eq $name })
+{
+Import-Module -Name $name
+$true
+} <#end if module is available then import#>
+else { $false } <#module not available#>
+InstallAWSToolsforWindowsPowerShell
+Import-Module -Name $name
+} <#end if module not installed then download/install/import module#>
+else { $true } <#module already loaded#>
+} #end function get-MyModule
+
+<#Check that localDirectory and brandCode are not null#>
+function checkVariables {
+if ($localDirectory -eq $null) {
+Write-Output "The localDirectory Variable has not been defined, please update the script with the target local directory and run again"
+$global:LogFile += "The localDirectory Variable has not been defined, please update the script with the target local directory and run again`n"
+}
+if ($brandCodes -eq $null) {
+Write-Output "The brand code has not been defined, please update or correct the brandcode"
+$global:LogFile += "The brand code has not been defined, please update or correct the brandcode`n"
+}
+}
+
+<#Check to make sure the specified target bucket exists#>
+function validateS3Bucket {
+$bucketTest = Get-S3Bucket -BucketName $S3BucketName
+#If the bucketTest variable == null, then the call has returned Zero matching buckets
+if ($bucketTest -eq $null)
+{
+eventLog -eventMessage "The requested bucket $S3BucketName doesn't exist, please update the target bucket name" -eventID 001 -entryType "Error"
+Exit
+}
+}
+
+<# Attempt to get target S3 Bucket#>
+function buildBrands {
+Try
+{
+$S3BucketObjects = Get-S3Object -BucketName $S3BucketName -Region $AWSRegion
+}
+catch
+{
+$ErrorMessage = $_.Exception.Message
+$FailedItem = $_.Exception.ItemName
+Write-Output "Critical Failure " $FailedItem + " " + $ErrorMessage
+$global:LogFile += "Critical Failure $FailedItem $ErrorMessage`n"
+}
+<#Loop over the returned objects from the Get-S3Objects call and extract any folder (denoted with /)#>
+Foreach ($bucketObject in $S3BucketObjects)
+{
+#Write-Host "I am a file named ::" $bucketObject.Key -ForegroundColor Green
+# Process the s3 Key (which is the full path including many "/" to denote folder splits
+$splitKey = $bucketObject.Key.Split("/",[System.StringSplitOptions]::RemoveEmptyEntries)
+if ($splitKey.Count -eq 1)
+{
+Write-Host "Key array contains only single split, Folder detected $splitKey"
+$global:brandCodes += $splitKey
+}
+}
+}
+
+<#Function to process the supplied Local Directory#>
+function processDirectory {
+$files = Get-ChildItem -Path $localDirectory
+$brandDetected=$false
+foreach ($file in $files)
+{
+do
+{
+foreach ($brandCode in $brandCodes)
+{
+if ($file.Name -match $brandCode)
+{
+Write-output "$file matching to brand $brandCode"
+$global:LogFile += "$file matching to brand $brandCode`n"
+$brandDetected=$true
+$destCheck = s3DestinationCheck -item $file -brandCode $brandCode
+if ($destCheck -eq $false)
+{
+Write-Output "Uploading file $file"
+$global:LogFile += "Uploading file $file`n"
+sendtoS3 -item $file -brandCode $brandCode
+}
+else
+{
+Write-Host "File $file already exists at destination" -ForegroundColor Yellow
+$global:LogFile += "File $file already exists at destination`n"
+
+}
+break
+}
+else
+{
+Write-Host "$file does not match brand code $brandCode" -ForegroundColor Red
+$global:LogFile += "$file does not match brand code $brandCode`n"
+}
+}
+} while ($brandDetected -eq $false)
+}
+}
+
+<#Function to upload files from the SourceDirectory to an S3bucket and delete source file if requested#>
+function sendtoS3 {
+Param
+(
+[Parameter(Mandatory=$true, Position=0)]
+$item,
+[Parameter(Mandatory=$true, Position=0)]
+$brandCode
+)
+#construct the s3Path
+$s3Path = $brandCode + "/" + $item.name
+Write-Output "this is the s3 Path $s3Path"
+$global:LogFile += "this is the s3 Path $s3Path.`n"
+Write-S3Object -BucketName $S3BucketName -Key $s3Path -File $item.fullName -Region $AWSRegion
+$global:LogFile += "File $item.Name copied to $brandCode.`r`n"
+# If requested - delete source file
+if ($DeleteSource) # If $DeleteSource param set - delete files in $SourceDirectory
+{
+Remove-Item -Path $item.fullName -force
+}
+}
+
+<#Function to validate files against what's in the S3Buckets already#>
+function s3DestinationCheck {
+Param
+(
+[Parameter(Mandatory=$true, Position=0)]
+$item,
+[Parameter(Mandatory=$true, Position=0)]
+$brandCode
+)
+# -Key needs to contain both the file name and the target directory
+$fullKeyPath = $brandCode + "/" + $item.Name
+$fileExists = Get-S3Object -BucketName $S3BucketName -Region $AWSRegion -Key $fullKeyPath
+Write-Output $fileExists.Count
+$global:LogFile += "$fileExists.Count`n"
+if ($fileExists.Count -eq 0)
+{
+Write-Host "$item does not exist within $brandCode"
+$global:LogFile += "$item does not exist within $brandCode.`n"
+return $false
+}
+if ($fileExists.Count -ne 0)
+{
+Write-output "$item does exist within $brandCode" -ForegroundColor Red
+$global:LogFile += "$item does exist within $brandCode`n"
+return $true
+}
+}
+
+<#Function to send information/errors to EventLog#>
+function eventLog {
+Param (
+[Parameter(Mandatory=$true, Position=0)]
+[String]$eventMessage,
+[Parameter(Mandatory=$true, Position=1)]
+[int]$eventID,
+[Parameter(Mandatory=$true, Position=2)]
+[String]$entryType
+)
+switch ($entryType)
+{
+"Error"{Write-EventLog -LogName Application -Source "PMS-Uploader" -EventID $eventID -Message $eventMessage -EntryType Error; Break}
+"Information"{Write-EventLog -LogName Application -Source "PMS-Uploader" -EventID $eventID -Message $eventMessage -EntryType Information; Break}
+"Warning"{Write-EventLog -LogName Application -Source "PMS-Uploader" -EventID $eventID -Message $eventMessage -EntryType Warning; Break}
+}
+}
+get-MyModule AWSPowerShell
+validateS3Bucket
+buildBrands
+processDirectory
+eventLog -eventMessage $LogFile -eventID 001 -entryType "Information"
